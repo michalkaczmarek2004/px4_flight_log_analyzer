@@ -4,11 +4,11 @@ Conventions:
 - measured signals are solid blue, requested (setpoint) signals dashed orange
 - quantities with different units go in stacked panels, never on a second y-axis
 - masked samples (NaN) and logging gaps break the line instead of being bridged
+- anomaly intervals are shaded in status colors with a text label (highlight_anomalies)
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -286,36 +286,67 @@ def create_figures(topics: dict[str, pd.DataFrame]) -> dict[str, go.Figure]:
     return figures
 
 
-def save_report(figures: dict[str, go.Figure], path: str | Path, title: str) -> Path:
-    """Write all figures into one self-contained HTML file (works offline)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parts = []
-    for i, fig in enumerate(figures.values()):
-        # Embed plotly.js once, in the first figure.
-        parts.append(fig.to_html(full_html=False, include_plotlyjs=(i == 0), config={"displaylogo": False}))
-    body = "\n".join(f'<section class="chart">{part}</section>' for part in parts)
-    path.write_text(
-        f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  body {{ margin: 0; padding: 24px 16px; background: #f9f9f7; color: {TEXT_PRIMARY};
-         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }}
-  main {{ max-width: 1100px; margin: 0 auto; }}
-  h1 {{ font-size: 20px; font-weight: 600; margin: 0 0 16px; }}
-  .chart {{ background: {SURFACE}; border: 1px solid rgba(11,11,11,0.10); border-radius: 8px;
-           padding: 8px; margin-bottom: 16px; }}
-</style>
-</head>
-<body><main><h1>{title}</h1>
-{body}
-</main></body>
-</html>
-""",
-        encoding="utf-8",
-    )
-    return path
+# Status colors (reserved for anomaly severity, always shown with a text label)
+SEVERITY_COLORS = {"critical": "#d03b3b", "warning": "#fab219"}
+
+# Which charts show each detector's events. Sampling gaps / invalid data map by topic.
+_CHARTS_BY_DETECTOR = {
+    "logging_dropouts": ["altitude", "velocity", "battery", "attitude", "tracking_error"],
+    "battery": ["battery"],
+    "altitude_tracking": ["altitude", "tracking_error"],
+    "position_tracking": ["tracking_error"],
+    "estimator_resets": ["altitude", "tracking_error"],
+    "estimator_quality": ["altitude", "tracking_error"],
+    "flight_events": ["altitude", "velocity", "attitude"],
+}
+_CHARTS_BY_TOPIC = {
+    "vehicle_local_position": ["altitude", "velocity", "tracking_error"],
+    "battery_status": ["battery"],
+    "vehicle_attitude": ["attitude"],
+}
+
+
+def _charts_for(anomaly) -> list[str]:
+    if anomaly.detector == "sampling_gaps":
+        topics = anomaly.evidence.get("topics", [anomaly.topic])
+        return sorted({chart for topic in topics for chart in _CHARTS_BY_TOPIC.get(topic, [])})
+    return _CHARTS_BY_DETECTOR.get(anomaly.detector, [])
+
+
+def highlight_anomalies(figures: dict[str, go.Figure], anomalies: list) -> dict[str, go.Figure]:
+    """Shade warning/critical anomaly intervals (and mark instants) on the time charts they concern.
+
+    Informational events, summary events and PX4 text messages are not drawn; the report lists them.
+    Each chart labels the first event of each check, so color is never the only cue.
+    """
+    labelled: set[tuple[str, str]] = set()
+    label_count: dict[str, int] = {}
+    for anomaly in anomalies:
+        color = SEVERITY_COLORS.get(anomaly.severity)
+        if color is None or anomaly.evidence.get("summary") or anomaly.start_s is None:
+            continue
+        if anomaly.topic == "logged_messages":  # text messages are listed in the report, not drawn
+            continue
+        for chart in _charts_for(anomaly):
+            fig = figures.get(chart)
+            if fig is None:
+                continue
+            rows = {"row": "all", "col": 1} if fig._has_subplots() else {}
+            if anomaly.end_s is not None and anomaly.end_s > anomaly.start_s:
+                fig.add_vrect(x0=anomaly.start_s, x1=anomaly.end_s, fillcolor=color, opacity=0.18,
+                              line_width=0, layer="below", **rows)
+            else:
+                fig.add_vline(x=anomaly.start_s, line={"color": color, "width": 1.5, "dash": "dot"}, **rows)
+            # One label per check per chart; the report's table has every event.
+            if (chart, anomaly.detector) not in labelled:
+                labelled.add((chart, anomaly.detector))
+                # Stagger labels in three rows so nearby events don't overlap.
+                n = label_count.get(chart, 0)
+                label_count[chart] = n + 1
+                fig.add_annotation(
+                    x=anomaly.start_s, y=1 - 0.09 * (n % 3), xref="x", yref="y domain", xanchor="left", yanchor="top",
+                    text=f"{'▲' if anomaly.severity == 'critical' else '●'} {anomaly.title}",
+                    showarrow=False, font={"size": 10, "color": TEXT_SECONDARY},
+                    bgcolor="rgba(252,252,251,0.85)", bordercolor=color, borderwidth=1,
+                )
+    return figures
