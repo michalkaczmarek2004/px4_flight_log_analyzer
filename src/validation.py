@@ -3,7 +3,10 @@
 validate_timestamps   - missing data (gaps/coverage), repeated and wrong timestamps
 validate_fields       - topics and fields exist and have the expected data type
 check_missing_values  - NaN, inf and values outside a field's allowed domain
-validate_signal       - signal behaviour against PX4 rules (validity flags, resets, limits)
+validate_signal       - signal plausibility against PX4 rules (validity flags, limits, jumps)
+
+Data quality only: flight events (battery warnings, failsafes, estimator resets and
+accuracy) are reported by src.anomalies.
 """
 
 from __future__ import annotations
@@ -100,10 +103,8 @@ MAX_TIME_BEFORE_START_S = 1.0  # samples logged slightly before start are normal
 # --- PX4 signal rules ---
 MAX_SPEED_MS = 100.0             # faster than any multicopter / small fixed-wing
 MAX_POSITION_JUMP_M = 50.0       # between consecutive samples without an EKF reset
-MAX_EPH_M = 10.0                 # horizontal position accuracy considered poor
 CELL_VOLTAGE_RANGE_V = (2.5, 4.5)  # LiPo/Li-ion cell, outside this the reading is implausible
 REMAINING_RISE_TOLERANCE = 0.05  # battery % shouldn't go up during a flight
-BATTERY_WARNING_NAMES = {1: "LOW", 2: "CRITICAL", 3: "EMERGENCY", 4: "FAILED", 6: "UNHEALTHY"}
 ARMING_STATE_ARMED = 2
 
 
@@ -227,7 +228,7 @@ def validate_fields(topics: dict[str, pd.DataFrame]) -> list[Issue]:
 # NaN / inf / wrong values
 # ---------------------------------------------------------------------------
 
-def _wrong_values(series: pd.Series, field: Field) -> pd.Series:
+def wrong_value_mask(series: pd.Series, field: Field) -> pd.Series:
     """Mask of finite values outside the field's allowed domain (unknown sentinel excluded)."""
     finite = series[np.isfinite(series.astype(float))]
     if field.kind == "enum":
@@ -277,7 +278,7 @@ def check_missing_values(topics: dict[str, pd.DataFrame]) -> list[Issue]:
                         severity, topic, "values",
                         f"{column}: {unknown}/{n} samples are {field.unknown:g} (PX4 'unknown')",
                     ))
-            wrong = int(_wrong_values(numeric[column], field).sum())
+            wrong = int(wrong_value_mask(numeric[column], field).sum())
             if wrong:
                 allowed = sorted(field.values) if field.kind == "enum" else f"{field.min:g}..{field.max:g}"
                 issues.append(Issue(
@@ -321,13 +322,8 @@ def _signal_local_position(df: pd.DataFrame) -> list[Issue]:
             for counter in ("xy_reset_counter", "z_reset_counter"):
                 if _has(df, counter):
                     reset |= df[counter].diff().fillna(0) != 0
-            explained = int((big & reset).sum())
+            # Jumps with a reset are reported by anomalies.detect_estimator_resets.
             unexplained = int((big & ~reset).sum())
-            if explained:
-                issues.append(Issue(
-                    INFO, topic, "signal",
-                    f"{explained} position jump(s) > {MAX_POSITION_JUMP_M:.0f} m caused by EKF reset",
-                ))
             if unexplained:
                 at = df["time_s"][big & ~reset].iloc[0]
                 issues.append(Issue(
@@ -335,14 +331,6 @@ def _signal_local_position(df: pd.DataFrame) -> list[Issue]:
                     f"{unexplained} position jump(s) > {MAX_POSITION_JUMP_M:.0f} m without EKF reset "
                     f"(first at t={at:.2f} s)",
                 ))
-
-    if _has(df, "eph"):
-        poor = int((df["eph"] > MAX_EPH_M).sum())
-        if poor:
-            issues.append(Issue(
-                WARNING, topic, "signal",
-                f"horizontal accuracy (eph) worse than {MAX_EPH_M:.0f} m in {poor}/{len(df)} samples",
-            ))
     return issues
 
 
@@ -395,18 +383,6 @@ def _signal_battery(df: pd.DataFrame) -> list[Issue]:
         drops = int((discharged.diff() < -1e-3).sum())
         if drops:
             issues.append(Issue(WARNING, topic, "signal", f"discharged_mah decreased {drops} time(s)"))
-
-    if _has(df, "warning"):
-        # Wrong enum values are reported by check_missing_values; ignore them here.
-        known = df["warning"][df["warning"].isin(BATTERY_WARNING_NAMES)]
-        if len(known):
-            worst = int(known.max())
-            at = df["time_s"][df["warning"] == worst].iloc[0]
-            severity = INFO if worst == 1 else WARNING
-            issues.append(Issue(
-                severity, topic, "signal",
-                f"battery warning {BATTERY_WARNING_NAMES[worst]} reached at t={at:.2f} s",
-            ))
     return issues
 
 
@@ -417,9 +393,6 @@ def _signal_vehicle_status(df: pd.DataFrame) -> list[Issue]:
         armed = df["arming_state"] == ARMING_STATE_ARMED
         if not armed.any():
             issues.append(Issue(INFO, topic, "signal", "vehicle never armed during the log"))
-    if _has(df, "failsafe") and (df["failsafe"] != 0).any():
-        at = df["time_s"][df["failsafe"] != 0].iloc[0]
-        issues.append(Issue(WARNING, topic, "signal", f"failsafe active (first at t={at:.2f} s)"))
     return issues
 
 

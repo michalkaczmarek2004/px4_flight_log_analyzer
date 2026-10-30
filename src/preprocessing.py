@@ -31,19 +31,30 @@ MAX_AGE_FACTOR = 3
 def calculate_relative_time(topics: dict[str, pd.DataFrame], t0_us: int | None = None) -> dict[str, pd.DataFrame]:
     """Put all topics on one time axis: time_s = (timestamp - t0) / 1e6.
 
+    Rows with timestamp 0 (never set by the publisher) can't be placed on any time
+    axis; they are dropped and counted in df.attrs["invalid_timestamps"]
+    (validation.validate_timestamps reports them too).
+
     Args:
         t0_us: reference time in µs (e.g. the arming timestamp). Defaults to the
-            earliest sample of all topics, so the common axis starts at 0 s.
+            log start stored by the parser (df.attrs["log_start_us"]), so all
+            modules share one axis; without it, the earliest sample of all topics.
     """
     if t0_us is None:
-        firsts = [int(df["timestamp"][df["timestamp"] > 0].min()) for df in topics.values() if (df["timestamp"] > 0).any()]
-        if not firsts:
-            return {name: df.copy() for name, df in topics.items()}
-        t0_us = min(firsts)
+        starts = {df.attrs.get("log_start_us") for df in topics.values()} - {None}
+        if len(starts) == 1:
+            t0_us = starts.pop()
+        else:
+            firsts = [int(df["timestamp"][df["timestamp"] > 0].min()) for df in topics.values() if (df["timestamp"] > 0).any()]
+            if not firsts:
+                return {name: df.copy() for name, df in topics.items()}
+            t0_us = min(firsts)
 
     result = {}
     for name, df in topics.items():
-        df = df.copy()
+        unset = df["timestamp"] == 0
+        df = df[~unset].copy()
+        df.attrs["invalid_timestamps"] = int(unset.sum())
         # timestamp is uint64; cast so samples before t0 become negative instead of wrapping.
         time_s = (df["timestamp"].astype("int64") - int(t0_us)) / 1e6
         if "time_s" in df.columns:
@@ -62,6 +73,23 @@ def calculate_altitude(local_pos: pd.DataFrame) -> pd.Series:
 def calculate_horizontal_speed(local_pos: pd.DataFrame) -> pd.Series:
     """Horizontal speed: V_xy = sqrt(vx^2 + vy^2)."""
     return np.sqrt(local_pos["vx"] ** 2 + local_pos["vy"] ** 2).rename("horizontal_speed_ms")
+
+
+def quaternion_to_euler(df: pd.DataFrame, prefix: str = "q") -> pd.DataFrame:
+    """Roll, pitch, yaw in degrees from a PX4 quaternion [w, x, y, z] (body -> NED, ZYX order).
+
+    Args:
+        prefix: column prefix, "q" for vehicle_attitude or "q_d" for vehicle_attitude_setpoint.
+    """
+    w, x, y, z = (df[f"{prefix}[{i}]"].to_numpy(dtype=float) for i in range(4))
+    roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x ** 2 + y ** 2))
+    pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y ** 2 + z ** 2))
+    return pd.DataFrame(
+        {"time_s": df["time_s"].to_numpy(), "roll_deg": np.degrees(roll),
+         "pitch_deg": np.degrees(pitch), "yaw_deg": np.degrees(yaw)},
+        index=df.index,
+    )
 
 
 def _sorted_unique_time(df: pd.DataFrame) -> pd.DataFrame:
